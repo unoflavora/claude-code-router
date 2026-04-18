@@ -22,6 +22,13 @@ export const config = {
   // One of: acceptEdits, auto, bypassPermissions, default, dontAsk, plan
   permissionMode: process.env.PERMISSION_MODE || "",
 
+  // Appended to Claude Code's built-in system prompt (via --append-system-prompt).
+  // Default nudges the model to acknowledge the user before firing tool calls,
+  // so clients see text immediately instead of silent seconds before tool_use events.
+  claudeAppendSystemPrompt:
+    process.env.CLAUDE_APPEND_SYSTEM_PROMPT ||
+    "Before making any tool call, first respond to the user in one short sentence describing what you're about to do. Then proceed with the tool call.",
+
   // Allowed API keys (comma-separated). Empty = no auth required.
   apiKeys: process.env.API_KEYS ? process.env.API_KEYS.split(",").map((k) => k.trim()) : [],
 };

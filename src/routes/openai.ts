@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { v4 as uuidv4 } from "uuid";
 import { stream as honoStream } from "hono/streaming";
-import { execClaude, execClaudeStream } from "../claude.js";
+import { execClaude, execClaudeStreamJson } from "../claude.js";
 import { openaiToPrompt, type OpenAIChatRequest } from "../convert.js";
 
 const MODEL_NAME = "claude-code";
@@ -25,60 +25,47 @@ openai.post("/v1/chat/completions", async (c) => {
     c.header("Connection", "keep-alive");
 
     return honoStream(c, async (stream) => {
-      await new Promise<void>((resolve, reject) => {
-        execClaudeStream(
+      await new Promise<void>((resolve) => {
+        let toolCallIndex = 0;
+        const writeChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => {
+          const chunk = {
+            id: requestId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          };
+          stream.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        };
+
+        execClaudeStreamJson(
           prompt,
-          (delta) => {
-            const chunk = {
-              id: requestId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: delta },
-                  finish_reason: null,
-                },
-              ],
-            };
-            stream.write(`data: ${JSON.stringify(chunk)}\n\n`);
-          },
-          (_fullText) => {
-            const done = {
-              id: requestId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: {},
-                  finish_reason: "stop",
-                },
-              ],
-            };
-            stream.write(`data: ${JSON.stringify(done)}\n\n`);
-            stream.write("data: [DONE]\n\n");
-            resolve();
-          },
-          (err) => {
-            const errChunk = {
-              id: requestId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: `\n\nError: ${err.message}` },
-                  finish_reason: "stop",
-                },
-              ],
-            };
-            stream.write(`data: ${JSON.stringify(errChunk)}\n\n`);
-            stream.write("data: [DONE]\n\n");
-            resolve();
+          (event) => {
+            if (event.type === "text") {
+              writeChunk({ content: event.text });
+            } else if (event.type === "tool_use") {
+              writeChunk({
+                tool_calls: [
+                  {
+                    index: toolCallIndex++,
+                    id: event.id,
+                    type: "function",
+                    function: {
+                      name: event.name,
+                      arguments: JSON.stringify(event.input ?? {}),
+                    },
+                  },
+                ],
+              });
+            } else if (event.type === "done") {
+              writeChunk({}, "stop");
+              stream.write("data: [DONE]\n\n");
+              resolve();
+            } else if (event.type === "error") {
+              writeChunk({ content: `\n\nError: ${event.message}` }, "stop");
+              stream.write("data: [DONE]\n\n");
+              resolve();
+            }
           },
           systemPrompt
         );
