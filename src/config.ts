@@ -7,9 +7,10 @@ export const config = {
   claudeModel: process.env.CLAUDE_MODEL || "", // empty = use CLI default
   maxTurnCount: parseInt(process.env.CLAUDE_MAX_TURNS || "1", 10),
 
-  // Startup mode: "bare" (fastest, requires ANTHROPIC_API_KEY or --settings apiKeyHelper; OAuth/keychain not read),
-  // "lean" (--setting-sources, supports CLAUDE_CODE_OAUTH_TOKEN), "full" (no flags, loads everything)
-  claudeMode: (process.env.CLAUDE_MODE || "lean") as "bare" | "lean" | "full",
+  // Startup mode: "lean" (--setting-sources) or "full" (no flags, loads everything).
+  // Both support CLAUDE_CODE_OAUTH_TOKEN. Bare mode was removed because it
+  // rejects OAuth tokens (requires ANTHROPIC_API_KEY or apiKeyHelper).
+  claudeMode: (process.env.CLAUDE_MODE || "lean") as "lean" | "full",
   claudeSettings: process.env.CLAUDE_SETTINGS || "claude-settings.json", // path or JSON string for --settings
   claudeSettingSources: process.env.CLAUDE_SETTING_SOURCES || "user", // which config sources to load in lean mode
 
@@ -28,6 +29,10 @@ export const config = {
   claudeAppendSystemPrompt:
     process.env.CLAUDE_APPEND_SYSTEM_PROMPT ||
     "Before making any tool call, first respond to the user in one short sentence describing what you're about to do. Then proceed with the tool call.",
+
+  // SSE heartbeat interval (ms) while streaming. 0 = disabled. Keeps proxies
+  // and clients from closing connections during long MCP tool waits.
+  sseHeartbeatMs: parseInt(process.env.SSE_HEARTBEAT_MS || "10000", 10),
 
   // Allowed API keys (comma-separated). Empty = no auth required.
   apiKeys: process.env.API_KEYS ? process.env.API_KEYS.split(",").map((k) => k.trim()) : [],

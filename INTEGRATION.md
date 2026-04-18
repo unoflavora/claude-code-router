@@ -99,7 +99,7 @@ Tools not on the allowlist are blocked at the CLI layer.
 
 - `usage` tokens are always `0` — the CLI wrapper doesn't surface token counts.
 - `CLAUDE_MAX_TURNS` caps the number of agent turns per request (default 1, staging uses 5 so MCP tool loops can complete).
-- Streaming deltas come from the CLI's `--bare`/plain text output, not the native Anthropic streaming protocol — chunk shape is faithful but there are no tool_use blocks in the response body, only the final text.
+- `stop_reason` / `finish_reason` is always `end_turn` / `stop`. Tool calls are resolved server-side by the CLI, so `tool_use` / `tool_calls` blocks are informational — clients shouldn't try to round-trip them.
 
 ## Server configuration
 
@@ -112,7 +112,7 @@ Config is read from environment variables (`.env` or `docker-compose.yml`).
 | `CLAUDE_BINARY`               | `claude`               | Path to Claude Code CLI                                                                                  |
 | `CLAUDE_MODEL`                | *(empty)*              | Pin a specific model (empty = CLI default)                                                               |
 | `CLAUDE_MAX_TURNS`            | `1`                    | Max agent turns per request                                                                              |
-| `CLAUDE_MODE`                 | `lean`                 | `bare` \| `lean` \| `full`. **Bare rejects OAuth** — needs `ANTHROPIC_API_KEY` or `apiKeyHelper`         |
+| `CLAUDE_MODE`                 | `lean`                 | `lean` (recommended) \| `full`. Both support OAuth tokens                                                |
 | `CLAUDE_CODE_OAUTH_TOKEN`     | *(required)*           | OAuth token from `claude setup-token` (works in lean/full only)                                          |
 | `CLAUDE_SETTINGS`             | `claude-settings.json` | Path or JSON for `--settings`                                                                            |
 | `CLAUDE_SETTING_SOURCES`      | `user`                 | Which setting sources to load in lean mode                                                               |
@@ -150,7 +150,7 @@ ssh hcportal@10.1.200.218 '
 
 | Symptom                                   | Cause                                                                        |
 |-------------------------------------------|------------------------------------------------------------------------------|
-| `Invalid API key · Fix external API key`  | `CLAUDE_MODE=bare` with OAuth token. Switch to `lean` or `full`.             |
+| `Invalid API key · Fix external API key`  | Stale or wrong `CLAUDE_CODE_OAUTH_TOKEN`. Refresh via `claude setup-token`.  |
 | `Not logged in · Please run /login`       | No `CLAUDE_CODE_OAUTH_TOKEN` reaching the container                          |
 | `tool call was blocked pending permission`| Tool not in `ALLOWED_TOOLS`, or `PERMISSION_MODE` blocks it                  |
 | `fetch failed` to MCP URL                 | Self-signed cert — set `NODE_TLS_REJECT_UNAUTHORIZED=0`                      |

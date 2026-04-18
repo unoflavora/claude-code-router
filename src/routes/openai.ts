@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import { v4 as uuidv4 } from "uuid";
 import { stream as honoStream } from "hono/streaming";
-import { execClaude, execClaudeStreamJson } from "../claude.js";
+import { execClaudeAggregate, execClaudeStreamJson } from "../claude.js";
 import { openaiToPrompt, type OpenAIChatRequest } from "../convert.js";
+import { config } from "../config.js";
 
 const MODEL_NAME = "claude-code";
 
@@ -38,6 +39,15 @@ openai.post("/v1/chat/completions", async (c) => {
           stream.write(`data: ${JSON.stringify(chunk)}\n\n`);
         };
 
+        const heartbeat = config.sseHeartbeatMs > 0
+          ? setInterval(() => void stream.write(": heartbeat\n\n"), config.sseHeartbeatMs)
+          : null;
+        const finish = () => {
+          if (heartbeat) clearInterval(heartbeat);
+          stream.write("data: [DONE]\n\n");
+          resolve();
+        };
+
         execClaudeStreamJson(
           prompt,
           (event) => {
@@ -59,12 +69,10 @@ openai.post("/v1/chat/completions", async (c) => {
               });
             } else if (event.type === "done") {
               writeChunk({}, "stop");
-              stream.write("data: [DONE]\n\n");
-              resolve();
+              finish();
             } else if (event.type === "error") {
               writeChunk({ content: `\n\nError: ${event.message}` }, "stop");
-              stream.write("data: [DONE]\n\n");
-              resolve();
+              finish();
             }
           },
           systemPrompt
@@ -73,8 +81,22 @@ openai.post("/v1/chat/completions", async (c) => {
     });
   }
 
-  // Non-streaming
-  const result = await execClaude(prompt, systemPrompt);
+  // Non-streaming — aggregate text + tool_use from stream-json events.
+  const result = await execClaudeAggregate(prompt, systemPrompt);
+
+  const content = result.blocks
+    .filter((b): b is Extract<typeof b, { type: "text" }> => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+
+  const toolCalls = result.blocks
+    .filter((b): b is Extract<typeof b, { type: "tool_use" }> => b.type === "tool_use")
+    .map((b, index) => ({
+      index,
+      id: b.id,
+      type: "function" as const,
+      function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
+    }));
 
   return c.json({
     id: requestId,
@@ -86,16 +108,13 @@ openai.post("/v1/chat/completions", async (c) => {
         index: 0,
         message: {
           role: "assistant",
-          content: result.text,
+          content: content || null,
+          ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: "stop",
       },
     ],
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
 });
 

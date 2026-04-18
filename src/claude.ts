@@ -1,20 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { config } from "./config.js";
 
-export interface ClaudeResult {
-  text: string;
-  exitCode: number;
-}
-
 /**
- * Build the CLI args for `claude -p --bare`.
+ * Build the CLI args for `claude -p`.
  */
 function buildArgs(prompt: string, systemPrompt?: string): string[] {
   const args = ["-p", prompt];
 
-  if (config.claudeMode === "bare") {
-    args.push("--bare");
-  } else if (config.claudeMode === "lean") {
+  if (config.claudeMode === "lean") {
     args.push("--setting-sources", config.claudeSettingSources);
   }
   // "full" = no flags, load everything
@@ -58,92 +51,6 @@ function buildArgs(prompt: string, systemPrompt?: string): string[] {
 }
 
 /**
- * Run claude CLI and collect the full response.
- */
-export async function execClaude(prompt: string, systemPrompt?: string): Promise<ClaudeResult> {
-  const args = buildArgs(prompt, systemPrompt);
-
-  return new Promise((resolve, reject) => {
-    const proc = spawn(config.claudeBinary, args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    proc.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on("close", (code) => {
-      if (code !== 0 && !stdout.trim()) {
-        reject(new Error(`claude exited with code ${code}: ${stderr}`));
-        return;
-      }
-      resolve({ text: stdout.trim(), exitCode: code ?? 0 });
-    });
-
-    proc.on("error", (err) => {
-      reject(new Error(`Failed to spawn claude: ${err.message}`));
-    });
-
-    proc.stdin.end();
-  });
-}
-
-/**
- * Run claude CLI and stream partial results via callback.
- * --bare outputs raw text, so every stdout chunk is a delta.
- */
-export function execClaudeStream(
-  prompt: string,
-  onDelta: (delta: string) => void,
-  onDone: (fullText: string) => void,
-  onError: (err: Error) => void,
-  systemPrompt?: string
-): { proc: ChildProcessWithoutNullStreams } {
-  const args = buildArgs(prompt, systemPrompt);
-
-  const proc = spawn(config.claudeBinary, args, {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: process.env,
-  });
-
-  let fullText = "";
-
-  proc.stdout.on("data", (chunk: Buffer) => {
-    const delta = chunk.toString();
-    fullText += delta;
-    onDelta(delta);
-  });
-
-  let stderr = "";
-  proc.stderr.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-
-  proc.on("close", (code) => {
-    if (code !== 0 && !fullText) {
-      onError(new Error(`claude exited with code ${code}: ${stderr}`));
-    } else {
-      onDone(fullText);
-    }
-  });
-
-  proc.on("error", (err) => {
-    onError(new Error(`Failed to spawn claude: ${err.message}`));
-  });
-
-  proc.stdin.end();
-  return { proc };
-}
-
-/**
  * Event emitted while streaming the Claude CLI in stream-json mode.
  * - "text": an assistant text block arrived
  * - "tool_use": the agent called a tool (including built-ins and MCP tools)
@@ -155,6 +62,57 @@ export type ClaudeEvent =
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "done"; stopReason: string | null; finalText: string; costUsd?: number; durationMs?: number }
   | { type: "error"; message: string };
+
+/**
+ * One content block in the aggregated (non-stream) response.
+ * Order matches the order events arrived from the CLI.
+ */
+export type ClaudeContentBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: unknown };
+
+export interface ClaudeAggregated {
+  blocks: ClaudeContentBlock[];
+  stopReason: string | null;
+  finalText: string;
+  costUsd?: number;
+  durationMs?: number;
+}
+
+/**
+ * Run claude CLI to completion and aggregate all text + tool_use events
+ * into a single response. Uses the same stream-json parser as the streaming
+ * path, so tool calls are preserved in the non-streaming response body.
+ */
+export function execClaudeAggregate(prompt: string, systemPrompt?: string): Promise<ClaudeAggregated> {
+  return new Promise((resolve, reject) => {
+    const blocks: ClaudeContentBlock[] = [];
+    let stopReason: string | null = null;
+    let finalText = "";
+    let costUsd: number | undefined;
+    let durationMs: number | undefined;
+
+    execClaudeStreamJson(
+      prompt,
+      (event) => {
+        if (event.type === "text") {
+          blocks.push({ type: "text", text: event.text });
+        } else if (event.type === "tool_use") {
+          blocks.push({ type: "tool_use", id: event.id, name: event.name, input: event.input });
+        } else if (event.type === "done") {
+          stopReason = event.stopReason;
+          finalText = event.finalText;
+          costUsd = event.costUsd;
+          durationMs = event.durationMs;
+          resolve({ blocks, stopReason, finalText, costUsd, durationMs });
+        } else if (event.type === "error") {
+          reject(new Error(event.message));
+        }
+      },
+      systemPrompt
+    );
+  });
+}
 
 /**
  * Run claude CLI with --output-format stream-json and emit structured events.
