@@ -5,7 +5,9 @@ export const config = {
   // Claude CLI settings
   claudeBinary: process.env.CLAUDE_BINARY || "claude",
   claudeModel: process.env.CLAUDE_MODEL || "", // empty = use CLI default
-  maxTurnCount: parseInt(process.env.CLAUDE_MAX_TURNS || "1", 10),
+  // Max agent turns per request. 0 = no limit (don't pass --max-turns).
+  // Default is generous enough for multi-step analyst loops; lower if you want hard caps.
+  maxTurnCount: parseInt(process.env.CLAUDE_MAX_TURNS || "20", 10),
 
   // Startup mode: "lean" (--setting-sources) or "full" (no flags, loads everything).
   // Both support CLAUDE_CODE_OAUTH_TOKEN. Bare mode was removed because it
@@ -20,6 +22,9 @@ export const config = {
 
   // Tool permissions: comma/space-separated allowlist (e.g. "mcp__dbportal__list_connections Bash")
   allowedTools: process.env.ALLOWED_TOOLS || "",
+  // Comma/space-separated denylist. Defaults to blocking ToolSearch so MCP tool schemas
+  // are used directly instead of being deferred behind a discovery tool (saves a turn).
+  disallowedTools: process.env.DISALLOWED_TOOLS ?? "ToolSearch",
   // One of: acceptEdits, auto, bypassPermissions, default, dontAsk, plan
   permissionMode: process.env.PERMISSION_MODE || "",
 

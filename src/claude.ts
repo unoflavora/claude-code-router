@@ -27,6 +27,10 @@ function buildArgs(prompt: string, systemPrompt?: string): string[] {
     args.push("--allowedTools", config.allowedTools);
   }
 
+  if (config.disallowedTools) {
+    args.push("--disallowedTools", config.disallowedTools);
+  }
+
   if (config.permissionMode) {
     args.push("--permission-mode", config.permissionMode);
   }
@@ -43,7 +47,7 @@ function buildArgs(prompt: string, systemPrompt?: string): string[] {
     args.push("--model", config.claudeModel);
   }
 
-  if (config.maxTurnCount) {
+  if (config.maxTurnCount > 0) {
     args.push("--max-turns", String(config.maxTurnCount));
   }
 
