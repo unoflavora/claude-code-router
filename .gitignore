@@ -4,3 +4,5 @@ dist/
 *.log
 test-mcp-server.mjs
 test-mcp.json
+mcp-dbportal.json
+mcp-*.local.json

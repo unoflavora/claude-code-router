@@ -5,7 +5,15 @@ services:
       - "4141:4141"
     environment:
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
-      - CLAUDE_MODE=bare
+      - CLAUDE_MODE=${CLAUDE_MODE:-lean}
       - CLAUDE_MODEL=${CLAUDE_MODEL:-}
       - CLAUDE_MAX_TURNS=${CLAUDE_MAX_TURNS:-1}
       - API_KEYS=${API_KEYS:-}
+      - MCP_CONFIG=${MCP_CONFIG:-}
+      - MCP_STRICT=${MCP_STRICT:-}
+      - ALLOWED_TOOLS=${ALLOWED_TOOLS:-}
+      - PERMISSION_MODE=${PERMISSION_MODE:-}
+      - NODE_TLS_REJECT_UNAUTHORIZED=${NODE_TLS_REJECT_UNAUTHORIZED:-}
+    volumes:
+      # MCP config file (must exist locally; path controlled by MCP_CONFIG_FILE, default ./mcp-dbportal.json)
+      - ${MCP_CONFIG_FILE:-./mcp-dbportal.json}:/app/mcp-dbportal.json:ro

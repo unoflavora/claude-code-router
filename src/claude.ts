@@ -23,6 +23,21 @@ function buildArgs(prompt: string, systemPrompt?: string): string[] {
     args.push("--settings", config.claudeSettings);
   }
 
+  if (config.mcpConfig) {
+    args.push("--mcp-config", config.mcpConfig);
+    if (config.strictMcpConfig) {
+      args.push("--strict-mcp-config");
+    }
+  }
+
+  if (config.allowedTools) {
+    args.push("--allowedTools", config.allowedTools);
+  }
+
+  if (config.permissionMode) {
+    args.push("--permission-mode", config.permissionMode);
+  }
+
   if (systemPrompt) {
     args.push("--system-prompt", systemPrompt);
   }
@@ -45,13 +60,9 @@ export async function execClaude(prompt: string, systemPrompt?: string): Promise
   const args = buildArgs(prompt, systemPrompt);
 
   return new Promise((resolve, reject) => {
-    const cliEnv = { ...process.env };
-    if (!cliEnv.ANTHROPIC_API_KEY && cliEnv.CLAUDE_CODE_OAUTH_TOKEN) {
-      cliEnv.ANTHROPIC_API_KEY = cliEnv.CLAUDE_CODE_OAUTH_TOKEN;
-    }
     const proc = spawn(config.claudeBinary, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: cliEnv,
+      env: process.env,
     });
 
     let stdout = "";
@@ -94,13 +105,9 @@ export function execClaudeStream(
 ): { proc: ChildProcessWithoutNullStreams } {
   const args = buildArgs(prompt, systemPrompt);
 
-  const cliEnv = { ...process.env };
-  if (!cliEnv.ANTHROPIC_API_KEY && cliEnv.CLAUDE_CODE_OAUTH_TOKEN) {
-    cliEnv.ANTHROPIC_API_KEY = cliEnv.CLAUDE_CODE_OAUTH_TOKEN;
-  }
   const proc = spawn(config.claudeBinary, args, {
     stdio: ["pipe", "pipe", "pipe"],
-    env: cliEnv,
+    env: process.env,
   });
 
   let fullText = "";

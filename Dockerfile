@@ -26,7 +26,7 @@ RUN chmod +x scripts/*.sh
 
 ENV PORT=4141
 ENV HOST=0.0.0.0
-ENV CLAUDE_MODE=bare
+ENV CLAUDE_MODE=lean
 
 EXPOSE 4141
 
