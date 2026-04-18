@@ -1,0 +1,32 @@
+{
+  "name": "claude-code-router",
+  "version": "1.0.0",
+  "description": "Route OpenAI/Anthropic-compatible API requests through Claude Code CLI",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format esm --dts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "claude",
+    "openai",
+    "api",
+    "router",
+    "proxy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^1.19.13",
+    "hono": "^4.12.12",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/uuid": "^10.0.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

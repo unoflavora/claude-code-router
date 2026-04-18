@@ -1,0 +1,3 @@
+{
+  "apiKeyHelper": "bash scripts/get-oauth-token.sh"
+}

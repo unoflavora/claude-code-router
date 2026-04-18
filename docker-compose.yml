@@ -1,0 +1,11 @@
+services:
+  claude-code-router:
+    build: .
+    ports:
+      - "4141:4141"
+    environment:
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - CLAUDE_MODE=bare
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-}
+      - CLAUDE_MAX_TURNS=${CLAUDE_MAX_TURNS:-1}
+      - API_KEYS=${API_KEYS:-}
