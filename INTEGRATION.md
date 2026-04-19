@@ -11,42 +11,166 @@ HTTP proxy that exposes the local `claude` CLI behind OpenAI- and Anthropic-comp
 
 ## Endpoints
 
-| Method | Path                    | Purpose                         |
-|--------|-------------------------|---------------------------------|
-| POST   | `/v1/chat/completions`  | OpenAI-compatible chat          |
-| POST   | `/v1/messages`          | Anthropic-compatible messages   |
-| GET    | `/v1/models`            | Lists the `claude-code` model   |
-| GET    | `/health`               | Liveness + token manager status |
-| GET    | `/token/current`        | Current OAuth token state       |
-| POST   | `/token/refresh`        | Force token refresh             |
+| Method | Path                    | Auth | Purpose                                                                   |
+|--------|-------------------------|:----:|---------------------------------------------------------------------------|
+| POST   | `/v1/chat/completions`  |  ✅  | OpenAI-compatible chat (streaming + non-streaming)                        |
+| POST   | `/v1/messages`          |  ✅  | Anthropic-compatible messages (streaming + non-streaming)                 |
+| GET    | `/v1/models`            |  ✅  | Lists the single model `claude-code`                                      |
+| GET    | `/`                     |  —   | Service index — name, version, endpoint map                               |
+| GET    | `/health`               |  —   | Liveness probe. Returns `{status, tokenManager}`                          |
+| GET    | `/token/current`        |  —   | Current OAuth token state. `404` when token manager is inactive (normal)  |
+| POST   | `/token/refresh`        |  —   | Force OAuth refresh — no-op unless token manager is active                |
 
-Model ID to pass: `claude-code`. The underlying Claude model is whatever `CLAUDE_MODEL` is set to on the server (empty = CLI default).
+`Auth ✅` means the endpoint requires the router API key when `API_KEYS` is set on the server. `/health`, `/token/*` and `/` are always unauthenticated (used for probes).
+
+Model ID to pass in request bodies: `claude-code`. The underlying Claude model is whatever `CLAUDE_MODEL` is set to on the server (empty = CLI default, currently `claude-sonnet-4-6`).
+
+### `POST /v1/chat/completions`
+
+OpenAI Chat Completions-compatible. Accepts the usual body:
+
+```json
+{
+  "model": "claude-code",
+  "messages": [{"role": "user", "content": "hello"}],
+  "stream": false
+}
+```
+
+Non-streaming response — includes `tool_calls` when the agent invoked MCP or built-in tools:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Here are the 4 connections...",
+      "tool_calls": [
+        { "index": 0, "id": "toolu_...", "type": "function",
+          "function": { "name": "mcp__dbportal__list_connections", "arguments": "{}" } }
+      ]
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+Streaming (`stream: true`) emits SSE `chat.completion.chunk` events. Each event is either a text delta, a tool_calls delta, or the terminator:
+
+```
+data: {"choices":[{"delta":{"content":"Let me check..."}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_...","type":"function","function":{"name":"mcp__dbportal__list_connections","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"delta":{"content":"4 connections: ..."}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+`finish_reason` is always `"stop"`. The SSE stream also emits `: heartbeat` comment lines every `SSE_HEARTBEAT_MS` while idle.
+
+### `POST /v1/messages`
+
+Anthropic Messages-compatible. Request body:
+
+```json
+{
+  "model": "claude-code",
+  "max_tokens": 512,
+  "messages": [{"role": "user", "content": "hello"}],
+  "stream": false
+}
+```
+
+Non-streaming response — `content` is an interleaved list of `text` and `tool_use` blocks in the order the agent produced them:
+
+```json
+{
+  "id": "msg_...",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-code",
+  "content": [
+    { "type": "text", "text": "Let me check the connections." },
+    { "type": "tool_use", "id": "toolu_...", "name": "mcp__dbportal__list_connections", "input": {} },
+    { "type": "text", "text": "There are 4 connections: ..." }
+  ],
+  "stop_reason": "end_turn",
+  "usage": { "input_tokens": 0, "output_tokens": 0 }
+}
+```
+
+Streaming emits the full Anthropic event protocol: `message_start`, `content_block_start`/`delta`/`stop` per block, `message_delta`, `message_stop`, plus `ping` events every `SSE_HEARTBEAT_MS`. Tool args arrive as a single `input_json_delta` (no partial-argument streaming).
+
+`stop_reason` is always `"end_turn"` — see *Limitations* below.
+
+### `GET /v1/models`
+
+```json
+{ "object": "list", "data": [{ "id": "claude-code", "object": "model", "owned_by": "claude-code-router" }] }
+```
+
+### `GET /health`
+
+```json
+{ "status": "ok", "tokenManager": false }
+```
+
+`tokenManager: false` is expected unless `CLAUDE_OAUTH_REFRESH_TOKEN` is configured (auto-refresh feature, off by default).
+
+### `GET /token/current`
+
+`404 {"error":"Token manager not active"}` when the auto-refresh token manager isn't enabled. This is **not** a bug — the router uses `CLAUDE_CODE_OAUTH_TOKEN` from env, and this endpoint only returns data when `CLAUDE_OAUTH_REFRESH_TOKEN` is also set.
+
+When active, returns `{ expiresAt, refreshedAt, ... }` describing the live token.
+
+### `POST /token/refresh`
+
+Forces an OAuth refresh round-trip. Returns `{ok: true}` on success, `500 {ok: false, error}` otherwise. No-op (but still responds) when the token manager is inactive.
 
 ## Authentication
 
-Router-side auth is optional: set `API_KEYS=key1,key2` on the server to require `Authorization: Bearer <key>`. Empty = no auth.
+**Router-side** — set `API_KEYS=key1,key2,...` on the server to require callers to present a matching key on every `/v1/*` request. Accepts either header:
 
-Upstream auth to Anthropic is via `CLAUDE_CODE_OAUTH_TOKEN` (set server-side). Clients never see it.
+```bash
+# Preferred — OpenAI/Anthropic SDKs send this by default
+curl -H 'Authorization: Bearer <your-key>' ...
 
-## OpenAI-compatible call
+# Also accepted
+curl -H 'x-api-key: <your-key>' ...
+```
+
+Missing/wrong key returns `401 {"error":{"message":"Invalid API key","type":"authentication_error","code":401}}`. Health and token endpoints bypass auth.
+
+**Upstream (to Anthropic)** — handled by the router using `CLAUDE_CODE_OAUTH_TOKEN`. Clients never see this value.
+
+Staging (`10.1.200.218`) currently has auth **enabled**. Ask the deployer for a key.
+
+## Client examples
+
+### curl
 
 ```bash
 curl -X POST http://10.1.200.218:4141/v1/chat/completions \
+  -H 'Authorization: Bearer <your-key>' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "claude-code",
-    "messages": [{"role": "user", "content": "hello"}]
-  }'
+  -d '{"model":"claude-code","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-With the OpenAI SDK:
+### OpenAI SDK
 
 ```ts
 import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "http://10.1.200.218:4141/v1",
-  apiKey: "unused", // or an API_KEYS value if auth is enabled
+  apiKey: process.env.CCR_API_KEY,
 });
 
 const resp = await client.chat.completions.create({
@@ -55,18 +179,21 @@ const resp = await client.chat.completions.create({
 });
 ```
 
-Streaming (`stream: true`) returns SSE chunks shaped like OpenAI `chat.completion.chunk`.
+### Anthropic SDK
 
-## Anthropic-compatible call
+```ts
+import Anthropic from "@anthropic-ai/sdk";
 
-```bash
-curl -X POST http://10.1.200.218:4141/v1/messages \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "claude-code",
-    "max_tokens": 256,
-    "messages": [{"role": "user", "content": "hello"}]
-  }'
+const client = new Anthropic({
+  baseURL: "http://10.1.200.218:4141",
+  authToken: process.env.CCR_API_KEY, // sent as Bearer
+});
+
+const resp = await client.messages.create({
+  model: "claude-code",
+  max_tokens: 512,
+  messages: [{ role: "user", content: "hello" }],
+});
 ```
 
 ## MCP tools (dbportal)
@@ -75,14 +202,9 @@ Staging is configured with the `dbportal` MCP server. Ask the model to call tool
 
 ```bash
 curl -X POST http://10.1.200.218:4141/v1/chat/completions \
+  -H 'Authorization: Bearer <your-key>' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "claude-code",
-    "messages": [{
-      "role": "user",
-      "content": "Use mcp__dbportal__list_connections and return the JSON."
-    }]
-  }'
+  -d '{"model":"claude-code","messages":[{"role":"user","content":"Use mcp__dbportal__list_connections and return the JSON."}]}'
 ```
 
 Allowlisted tools (staging):
@@ -98,7 +220,7 @@ Tools not on the allowlist are blocked at the CLI layer.
 ## Limitations
 
 - `usage` tokens are always `0` — the CLI wrapper doesn't surface token counts.
-- `CLAUDE_MAX_TURNS` caps the number of agent turns per request (default 1, staging uses 5 so MCP tool loops can complete).
+- `CLAUDE_MAX_TURNS` caps the number of agent turns per request (default 20, staging uses 30 for deeper analyst loops).
 - `stop_reason` / `finish_reason` is always `end_turn` / `stop`. Tool calls are resolved server-side by the CLI, so `tool_use` / `tool_calls` blocks are informational — clients shouldn't try to round-trip them.
 
 ## Server configuration
@@ -111,16 +233,19 @@ Config is read from environment variables (`.env` or `docker-compose.yml`).
 | `HOST`                        | `0.0.0.0`              | Listen address                                                                                           |
 | `CLAUDE_BINARY`               | `claude`               | Path to Claude Code CLI                                                                                  |
 | `CLAUDE_MODEL`                | *(empty)*              | Pin a specific model (empty = CLI default)                                                               |
-| `CLAUDE_MAX_TURNS`            | `1`                    | Max agent turns per request                                                                              |
+| `CLAUDE_MAX_TURNS`            | `20`                   | Max agent turns per request. `0` = no cap                                                                |
 | `CLAUDE_MODE`                 | `lean`                 | `lean` (recommended) \| `full`. Both support OAuth tokens                                                |
-| `CLAUDE_CODE_OAUTH_TOKEN`     | *(required)*           | OAuth token from `claude setup-token` (works in lean/full only)                                          |
+| `CLAUDE_CODE_OAUTH_TOKEN`     | *(required)*           | OAuth token from `claude setup-token`                                                                    |
 | `CLAUDE_SETTINGS`             | `claude-settings.json` | Path or JSON for `--settings`                                                                            |
 | `CLAUDE_SETTING_SOURCES`      | `user`                 | Which setting sources to load in lean mode                                                               |
+| `CLAUDE_APPEND_SYSTEM_PROMPT` | *(sensible default)*   | Appended to default system prompt; default nudges model to ack before tool calls                        |
 | `MCP_CONFIG`                  | *(empty)*              | Path (inside container) or JSON for `--mcp-config`                                                       |
 | `MCP_STRICT`                  | *(empty)*              | `1` = pass `--strict-mcp-config` (only use servers from `MCP_CONFIG`)                                    |
 | `ALLOWED_TOOLS`               | *(empty)*              | Space-separated tool allowlist, e.g. `mcp__dbportal__list_connections Bash`                              |
+| `DISALLOWED_TOOLS`            | `ToolSearch`           | Denylist. Default blocks the tool-discovery indirection; set `""` to allow                               |
 | `PERMISSION_MODE`             | *(empty)*              | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan`                       |
 | `NODE_TLS_REJECT_UNAUTHORIZED`| *(empty)*              | Set `0` when MCP endpoint uses a self-signed cert                                                        |
+| `SSE_HEARTBEAT_MS`            | `10000`                | SSE keepalive interval during streaming. `0` disables                                                    |
 | `API_KEYS`                    | *(empty)*              | Comma-separated router API keys; empty = no auth                                                         |
 
 ## Deploying to staging (`10.1.200.218`)
@@ -148,11 +273,14 @@ ssh hcportal@10.1.200.218 '
 
 ## Troubleshooting
 
-| Symptom                                   | Cause                                                                        |
-|-------------------------------------------|------------------------------------------------------------------------------|
-| `Invalid API key · Fix external API key`  | Stale or wrong `CLAUDE_CODE_OAUTH_TOKEN`. Refresh via `claude setup-token`.  |
-| `Not logged in · Please run /login`       | No `CLAUDE_CODE_OAUTH_TOKEN` reaching the container                          |
-| `tool call was blocked pending permission`| Tool not in `ALLOWED_TOOLS`, or `PERMISSION_MODE` blocks it                  |
-| `fetch failed` to MCP URL                 | Self-signed cert — set `NODE_TLS_REJECT_UNAUTHORIZED=0`                      |
-| `usage` always `0`                        | Expected — token counts aren't surfaced by the CLI wrapper                   |
-| Streaming stops mid-response              | `CLAUDE_MAX_TURNS` too low for the tool loop; bump it                        |
+| Symptom                                    | Cause / fix                                                                                                      |
+|--------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| `401 Invalid API key` from router          | Missing / wrong `Authorization: Bearer` header. Check `API_KEYS` on the server                                   |
+| `Invalid API key · Fix external API key`   | Upstream Anthropic error. Most often: `CLAUDE_CODE_OAUTH_TOKEN` expired (rotate via `claude setup-token`), or org hit the 5-hour overage cap (look for `rate_limit_event` in the CLI output). |
+| `Not logged in · Please run /login`        | No `CLAUDE_CODE_OAUTH_TOKEN` reaching the container. Verify `docker exec ... env \| grep OAUTH`                   |
+| `/token/current` returns 404               | Expected when the auto-refresh token manager isn't configured (`CLAUDE_OAUTH_REFRESH_TOKEN` unset). Not a bug    |
+| `tool call was blocked pending permission` | Tool not in `ALLOWED_TOOLS`, or `PERMISSION_MODE` blocks it                                                      |
+| `fetch failed` to MCP URL                  | Self-signed cert — set `NODE_TLS_REJECT_UNAUTHORIZED=0`                                                          |
+| `usage` always `0`                         | Expected — token counts aren't surfaced by the CLI wrapper                                                       |
+| Streaming stops mid-response               | `CLAUDE_MAX_TURNS` too low for the tool loop; bump it or set `0`                                                 |
+| Agent wastes a turn on `ToolSearch`        | `DISALLOWED_TOOLS=ToolSearch` (default). If you overrode it, add `ToolSearch` back                               |

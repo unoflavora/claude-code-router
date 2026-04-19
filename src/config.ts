@@ -13,7 +13,13 @@ export const config = {
   // Both support CLAUDE_CODE_OAUTH_TOKEN. Bare mode was removed because it
   // rejects OAuth tokens (requires ANTHROPIC_API_KEY or apiKeyHelper).
   claudeMode: (process.env.CLAUDE_MODE || "lean") as "lean" | "full",
-  claudeSettings: process.env.CLAUDE_SETTINGS || "claude-settings.json", // path or JSON string for --settings
+  // Path or JSON string for --settings. Empty = don't pass the flag.
+  // Default is empty because the bundled claude-settings.json only provides
+  // apiKeyHelper (for bare mode), which would submit the OAuth token as an
+  // api key — Anthropic intermittently rejects that, producing the misleading
+  // "Invalid API key · Fix external API key" response. Leaving it unset lets
+  // the CLI use CLAUDE_CODE_OAUTH_TOKEN via the proper OAuth path.
+  claudeSettings: process.env.CLAUDE_SETTINGS || "",
   claudeSettingSources: process.env.CLAUDE_SETTING_SOURCES || "user", // which config sources to load in lean mode
 
   // MCP: path or JSON for --mcp-config. When strict, only these MCP servers are loaded.
@@ -38,6 +44,11 @@ export const config = {
   // SSE heartbeat interval (ms) while streaming. 0 = disabled. Keeps proxies
   // and clients from closing connections during long MCP tool waits.
   sseHeartbeatMs: parseInt(process.env.SSE_HEARTBEAT_MS || "10000", 10),
+
+  // Max transparent retries on upstream Anthropic transient errors
+  // (the "Invalid API key · Fix external API key" assistant-text rejection).
+  // 0 disables retry; error is surfaced as-is.
+  upstreamRetryMax: parseInt(process.env.UPSTREAM_RETRY_MAX || "2", 10),
 
   // Allowed API keys (comma-separated). Empty = no auth required.
   apiKeys: process.env.API_KEYS ? process.env.API_KEYS.split(",").map((k) => k.trim()) : [],

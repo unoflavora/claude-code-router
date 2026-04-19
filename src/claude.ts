@@ -68,6 +68,14 @@ export type ClaudeEvent =
   | { type: "error"; message: string };
 
 /**
+ * Upstream Anthropic sometimes surfaces rate-limit / overage rejections as an
+ * assistant text block whose ONLY content is this exact string. It's neither
+ * our router's auth failure nor a genuine response. We detect and retry it
+ * transparently (see execClaudeStreamJsonWithRetry).
+ */
+const UPSTREAM_TRANSIENT_ERROR = "Invalid API key · Fix external API key";
+
+/**
  * One content block in the aggregated (non-stream) response.
  * Order matches the order events arrived from the CLI.
  */
@@ -84,9 +92,110 @@ export interface ClaudeAggregated {
 }
 
 /**
+ * Returns true if the aggregated response is just the upstream transient error
+ * (meaning retries were exhausted). Callers should surface this as a 503.
+ */
+export function isUpstreamTransientFinal(r: ClaudeAggregated): boolean {
+  return (
+    r.blocks.length === 1 &&
+    r.blocks[0].type === "text" &&
+    r.blocks[0].text === UPSTREAM_TRANSIENT_ERROR
+  );
+}
+
+/**
+ * Wraps execClaudeStreamJson with transparent retry on upstream transients.
+ *
+ * Strategy: a single `text` event whose body is exactly UPSTREAM_TRANSIENT_ERROR
+ * is held back instead of forwarded immediately. If the stream then ends with
+ * a `done` whose finalText is that same string (confirming it's the error and
+ * nothing else), we discard everything and re-run the CLI. Successful streams
+ * pass through unchanged — the only observed latency is for responses where
+ * the model naturally opens with that exact string, which is vanishingly rare.
+ *
+ * After config.upstreamRetryMax attempts, we flush what we have and emit an
+ * error event so callers can surface a 503.
+ */
+export function execClaudeStreamJsonWithRetry(
+  prompt: string,
+  onEvent: (event: ClaudeEvent) => void,
+  systemPrompt?: string
+): void {
+  const maxAttempts = Math.max(1, config.upstreamRetryMax + 1);
+
+  const attempt = (n: number) => {
+    const buffered: ClaudeEvent[] = [];
+    let sawNonErrorContent = false;
+    let heldErrorText: { type: "text"; text: string } | null = null;
+
+    const flushBuffered = () => {
+      for (const e of buffered) onEvent(e);
+      buffered.length = 0;
+      if (heldErrorText) {
+        onEvent(heldErrorText);
+        heldErrorText = null;
+      }
+    };
+
+    execClaudeStreamJson(
+      prompt,
+      (event) => {
+        if (event.type === "tool_use") {
+          sawNonErrorContent = true;
+          flushBuffered();
+          onEvent(event);
+          return;
+        }
+
+        if (event.type === "text") {
+          if (event.text === UPSTREAM_TRANSIENT_ERROR && !sawNonErrorContent) {
+            // Hold — might be the transient. Don't forward yet.
+            heldErrorText = event;
+            return;
+          }
+          sawNonErrorContent = true;
+          flushBuffered();
+          onEvent(event);
+          return;
+        }
+
+        if (event.type === "done") {
+          const isTransient =
+            !sawNonErrorContent &&
+            heldErrorText !== null &&
+            event.finalText === UPSTREAM_TRANSIENT_ERROR;
+
+          if (isTransient && n < maxAttempts) {
+            // Silent retry — client has seen nothing yet. Backoff ramps
+            // because these rejections cluster near the 5-hour budget edge.
+            const delayMs = 1000 * n + Math.floor(Math.random() * 500);
+            setTimeout(() => attempt(n + 1), delayMs);
+            return;
+          }
+
+          // Either success, or retries exhausted. Flush any held buffer.
+          flushBuffered();
+          onEvent(event);
+          return;
+        }
+
+        if (event.type === "error") {
+          flushBuffered();
+          onEvent(event);
+        }
+      },
+      systemPrompt
+    );
+  };
+
+  attempt(1);
+}
+
+/**
  * Run claude CLI to completion and aggregate all text + tool_use events
  * into a single response. Uses the same stream-json parser as the streaming
  * path, so tool calls are preserved in the non-streaming response body.
+ * Retries transparently on upstream transients.
  */
 export function execClaudeAggregate(prompt: string, systemPrompt?: string): Promise<ClaudeAggregated> {
   return new Promise((resolve, reject) => {
@@ -96,7 +205,7 @@ export function execClaudeAggregate(prompt: string, systemPrompt?: string): Prom
     let costUsd: number | undefined;
     let durationMs: number | undefined;
 
-    execClaudeStreamJson(
+    execClaudeStreamJsonWithRetry(
       prompt,
       (event) => {
         if (event.type === "text") {

@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { v4 as uuidv4 } from "uuid";
 import { stream as honoStream } from "hono/streaming";
-import { execClaudeAggregate, execClaudeStreamJson } from "../claude.js";
+import { execClaudeAggregate, execClaudeStreamJsonWithRetry, isUpstreamTransientFinal } from "../claude.js";
 import { anthropicToPrompt, type AnthropicMessagesRequest } from "../convert.js";
 import { config } from "../config.js";
 
@@ -52,7 +52,7 @@ anthropic.post("/v1/messages", async (c) => {
       };
 
       await new Promise<void>((resolve) => {
-        execClaudeStreamJson(
+        execClaudeStreamJsonWithRetry(
           prompt,
           (event) => {
             if (event.type === "text") {
@@ -131,6 +131,21 @@ anthropic.post("/v1/messages", async (c) => {
 
   // Non-streaming — aggregate all events into Anthropic content blocks.
   const result = await execClaudeAggregate(prompt, systemPrompt);
+
+  if (isUpstreamTransientFinal(result)) {
+    c.header("Retry-After", "30");
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "overloaded_error",
+          message:
+            "Upstream Anthropic rejected the request (likely org 5-hour budget exhausted). Retry later.",
+        },
+      },
+      503
+    );
+  }
 
   const content = result.blocks.map((b) =>
     b.type === "text"

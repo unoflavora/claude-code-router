@@ -16,6 +16,7 @@ services:
       - PERMISSION_MODE=${PERMISSION_MODE:-}
       - CLAUDE_APPEND_SYSTEM_PROMPT=${CLAUDE_APPEND_SYSTEM_PROMPT-}
       - SSE_HEARTBEAT_MS=${SSE_HEARTBEAT_MS:-}
+      - UPSTREAM_RETRY_MAX=${UPSTREAM_RETRY_MAX:-}
       - NODE_TLS_REJECT_UNAUTHORIZED=${NODE_TLS_REJECT_UNAUTHORIZED:-}
     volumes:
       # MCP config file (must exist locally; path controlled by MCP_CONFIG_FILE, default ./mcp-dbportal.json)
