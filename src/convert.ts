@@ -22,6 +22,10 @@ export interface OpenAIChatRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  tools?: Array<{ type?: string; function?: { name?: string } }>;
+  // Router extensions (ignored by OpenAI SDKs; safe to add)
+  effort?: string;
+  tier?: string;
 }
 
 // --- Anthropic types ---
@@ -44,6 +48,36 @@ export interface AnthropicMessagesRequest {
   stream?: boolean;
   max_tokens?: number;
   temperature?: number;
+  tools?: Array<{ name?: string }>;
+  // Router extensions
+  effort?: string;
+  tier?: string;
+}
+
+/**
+ * Extract tool names from a request body. Returns undefined if the client didn't
+ * send `tools` at all (server defaults apply); returns [] if they explicitly sent
+ * an empty list (= no tools allowed for this call).
+ */
+export function extractToolNames(
+  req: OpenAIChatRequest | AnthropicMessagesRequest
+): string[] | undefined {
+  if (!("tools" in req) || req.tools === undefined) return undefined;
+  if (!Array.isArray(req.tools)) return [];
+  const names: string[] = [];
+  for (const t of req.tools) {
+    if (!t) continue;
+    // OpenAI shape: { type: "function", function: { name } }
+    if ("function" in t && t.function?.name) {
+      names.push(t.function.name);
+      continue;
+    }
+    // Anthropic shape: { name }
+    if ("name" in t && typeof t.name === "string") {
+      names.push(t.name);
+    }
+  }
+  return names;
 }
 
 // --- Converters ---

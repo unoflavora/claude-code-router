@@ -31,6 +31,25 @@ export const config = {
   // Comma/space-separated denylist. Defaults to blocking ToolSearch so MCP tool schemas
   // are used directly instead of being deferred behind a discovery tool (saves a turn).
   disallowedTools: process.env.DISALLOWED_TOOLS ?? "ToolSearch",
+  // Built-in tools available to the model (--tools). Unlike allowedTools which gates
+  // *permission* to execute, --tools controls whether the tool is even visible in
+  // context. "" (default) hides all built-ins so MCP-only services don't see the
+  // model reach for Bash/Read/Grep. "default" = all built-ins. Or comma-separated list.
+  // Per-request `tools` in the request body overrides this.
+  claudeTools: process.env.CLAUDE_TOOLS ?? "",
+
+  // Reasoning effort (--effort). low | medium | high | max. Empty = CLI default.
+  // Per-request `effort` overrides.
+  claudeEffort: process.env.CLAUDE_EFFORT || "",
+  // Fallback model used when the primary is overloaded (--fallback-model). Empty = no fallback.
+  claudeFallbackModel: process.env.CLAUDE_FALLBACK_MODEL || "",
+  // Comma-separated allowlist of models clients may request via body.model.
+  // Empty = only the server-pinned CLAUDE_MODEL is honored (request `model` ignored).
+  // Aliases (sonnet/opus/haiku) and tier presets (fast/balanced/deep) are always accepted.
+  allowedModels: (process.env.ALLOWED_MODELS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
   // One of: acceptEdits, auto, bypassPermissions, default, dontAsk, plan
   permissionMode: process.env.PERMISSION_MODE || "",
 

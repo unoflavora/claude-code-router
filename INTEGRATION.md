@@ -23,7 +23,40 @@ HTTP proxy that exposes the local `claude` CLI behind OpenAI- and Anthropic-comp
 
 `Auth ✅` means the endpoint requires the router API key when `API_KEYS` is set on the server. `/health`, `/token/*` and `/` are always unauthenticated (used for probes).
 
-Model ID to pass in request bodies: `claude-code`. The underlying Claude model is whatever `CLAUDE_MODEL` is set to on the server (empty = CLI default, currently `claude-sonnet-4-6`).
+See `GET /v1/models` for the list clients may pass as `model`. Beyond `claude-code` (router default), the router accepts the aliases `sonnet`/`opus`/`haiku`, the tier presets `fast`/`balanced`/`deep`, and any full model ID listed in `ALLOWED_MODELS` on the server. If a request `model` isn't recognized, the server-pinned `CLAUDE_MODEL` is used.
+
+### Choosing model, effort, and tier
+
+Three request-body fields control routing and reasoning depth. All are optional.
+
+| Field   | Values                                          | Maps to                    |
+|---------|-------------------------------------------------|----------------------------|
+| `model` | `claude-code`, `sonnet`, `opus`, `haiku`, or any ID in `ALLOWED_MODELS` | `--model`         |
+| `effort`| `low` \| `medium` \| `high` \| `max`            | `--effort`                 |
+| `tier`  | `fast` \| `balanced` \| `deep`                  | `(model, effort)` preset   |
+
+Tier presets (applied only when `model`/`effort` aren't explicitly set):
+
+| Tier       | Model   | Effort  | Use case                                     |
+|------------|---------|---------|-----------------------------------------------|
+| `fast`     | haiku   | low     | Classification, short replies, high volume    |
+| `balanced` | sonnet  | medium  | Default — most chat and tool-calling work     |
+| `deep`     | opus    | high    | Longer chains of thought, harder problems     |
+
+Examples:
+
+```bash
+# Tier preset — fastest tier for a short classification
+curl ... -d '{"model":"claude-code","tier":"fast","messages":[...]}'
+
+# Explicit model + effort — overrides any tier choice
+curl ... -d '{"model":"opus","effort":"high","messages":[...]}'
+
+# Built-in alias only
+curl ... -d '{"model":"haiku","messages":[...]}'
+```
+
+Set `CLAUDE_FALLBACK_MODEL=sonnet` on the server for automatic fallback when the primary is overloaded.
 
 ### `POST /v1/chat/completions`
 
@@ -112,9 +145,24 @@ Streaming emits the full Anthropic event protocol: `message_start`, `content_blo
 
 ### `GET /v1/models`
 
+Returns the set of values acceptable in the request-body `model` field:
+
 ```json
-{ "object": "list", "data": [{ "id": "claude-code", "object": "model", "owned_by": "claude-code-router" }] }
+{
+  "object": "list",
+  "data": [
+    { "id": "claude-code", "object": "model", "owned_by": "claude-code-router" },
+    { "id": "sonnet",      "object": "model", "owned_by": "claude-code-router" },
+    { "id": "opus",        "object": "model", "owned_by": "claude-code-router" },
+    { "id": "haiku",       "object": "model", "owned_by": "claude-code-router" },
+    { "id": "fast",        "object": "model", "owned_by": "claude-code-router" },
+    { "id": "balanced",    "object": "model", "owned_by": "claude-code-router" },
+    { "id": "deep",        "object": "model", "owned_by": "claude-code-router" }
+  ]
+}
 ```
+
+Additional full model IDs appear when `ALLOWED_MODELS` lists them on the server.
 
 ### `GET /health`
 
@@ -207,7 +255,7 @@ curl -X POST http://10.1.200.218:4141/v1/chat/completions \
   -d '{"model":"claude-code","messages":[{"role":"user","content":"Use mcp__dbportal__list_connections and return the JSON."}]}'
 ```
 
-Allowlisted tools (staging):
+Server-wide allowlist on staging:
 
 - `mcp__dbportal__list_connections`
 - `mcp__dbportal__list_tables`
@@ -215,7 +263,61 @@ Allowlisted tools (staging):
 - `mcp__dbportal__validate_query`
 - `mcp__dbportal__execute_query`
 
-Tools not on the allowlist are blocked at the CLI layer.
+## Scoping tools per request
+
+Both endpoints accept a `tools` field in the request body (OpenAI or Anthropic shape). When present, it **overrides** the server defaults for this request — only the listed tools are available, no built-ins bleed through.
+
+Three effective modes:
+
+| Request `tools` field         | Built-ins available | MCP servers loaded          |
+|-------------------------------|:-------------------:|:----------------------------|
+| Omitted                       | per `CLAUDE_TOOLS`  | yes, if `MCP_CONFIG` set    |
+| `[]` (empty array)            | none                | **no** (MCP config skipped) |
+| `[{name: "mcp__dbportal__..."}]` | none             | yes                         |
+| `[{name: "Read"}, {name: "Grep"}]` | Read + Grep only | no                         |
+| `[{name: "mcp__..."}, {name: "Read"}]` | Read only     | yes                         |
+
+Any tool name starting with `mcp__` keeps the configured MCP config loaded; anything else is treated as a built-in. Tools the server doesn't know about are simply ignored by the CLI.
+
+Example — OpenAI shape, MCP-only:
+
+```bash
+curl -X POST http://10.1.200.218:4141/v1/chat/completions \
+  -H 'Authorization: Bearer <your-key>' -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-code",
+    "messages": [{"role": "user", "content": "list db connections"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "mcp__dbportal__list_connections",
+        "description": "list DB connections",
+        "parameters": {"type": "object"}
+      }
+    }]
+  }'
+```
+
+Example — Anthropic shape, built-ins only (no MCP):
+
+```bash
+curl -X POST http://10.1.200.218:4141/v1/messages \
+  -H 'Authorization: Bearer <your-key>' -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-code",
+    "max_tokens": 512,
+    "messages": [{"role": "user", "content": "read /etc/hosts"}],
+    "tools": [{"name": "Read", "description": "", "input_schema": {"type":"object"}}]
+  }'
+```
+
+Example — pure text answer, no tools:
+
+```bash
+curl ... -d '{ "model":"claude-code", "messages":[...], "tools": [] }'
+```
+
+Note: the *permission* allowlist (`ALLOWED_TOOLS` server env) still gates execution even for per-request tools. For MCP tools to actually run, they must also be listed there.
 
 ## Limitations
 
@@ -232,7 +334,10 @@ Config is read from environment variables (`.env` or `docker-compose.yml`).
 | `PORT`                        | `4141`                 | Listen port                                                                                              |
 | `HOST`                        | `0.0.0.0`              | Listen address                                                                                           |
 | `CLAUDE_BINARY`               | `claude`               | Path to Claude Code CLI                                                                                  |
-| `CLAUDE_MODEL`                | *(empty)*              | Pin a specific model (empty = CLI default)                                                               |
+| `CLAUDE_MODEL`                | *(empty)*              | Pin a specific model (empty = CLI default, currently Sonnet 4.6)                                         |
+| `CLAUDE_EFFORT`               | *(empty)*              | Reasoning effort. `low` \| `medium` \| `high` \| `max`                                                   |
+| `CLAUDE_FALLBACK_MODEL`       | *(empty)*              | Model to fall back to when the primary is overloaded                                                     |
+| `ALLOWED_MODELS`              | *(empty)*              | Comma-separated full model IDs clients may pass. Aliases + tiers always allowed                          |
 | `CLAUDE_MAX_TURNS`            | `20`                   | Max agent turns per request. `0` = no cap                                                                |
 | `CLAUDE_MODE`                 | `lean`                 | `lean` (recommended) \| `full`. Both support OAuth tokens                                                |
 | `CLAUDE_CODE_OAUTH_TOKEN`     | *(required)*           | OAuth token from `claude setup-token`                                                                    |
@@ -243,6 +348,7 @@ Config is read from environment variables (`.env` or `docker-compose.yml`).
 | `MCP_STRICT`                  | *(empty)*              | `1` = pass `--strict-mcp-config` (only use servers from `MCP_CONFIG`)                                    |
 | `ALLOWED_TOOLS`               | *(empty)*              | Space-separated tool allowlist, e.g. `mcp__dbportal__list_connections Bash`                              |
 | `DISALLOWED_TOOLS`            | `ToolSearch`           | Denylist. Default blocks the tool-discovery indirection; set `""` to allow                               |
+| `CLAUDE_TOOLS`                | `""` (none)            | Built-ins visible to the model (`--tools`). `""` = none; `default` = all; or a list like `Read,Grep`    |
 | `PERMISSION_MODE`             | *(empty)*              | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan`                       |
 | `NODE_TLS_REJECT_UNAUTHORIZED`| *(empty)*              | Set `0` when MCP endpoint uses a self-signed cert                                                        |
 | `SSE_HEARTBEAT_MS`            | `10000`                | SSE keepalive interval during streaming. `0` disables                                                    |

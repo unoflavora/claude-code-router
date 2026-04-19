@@ -1,8 +1,15 @@
 import { Hono } from "hono";
 import { v4 as uuidv4 } from "uuid";
 import { stream as honoStream } from "hono/streaming";
-import { execClaudeAggregate, execClaudeStreamJsonWithRetry, isUpstreamTransientFinal } from "../claude.js";
-import { openaiToPrompt, type OpenAIChatRequest } from "../convert.js";
+import {
+  execClaudeAggregate,
+  execClaudeStreamJsonWithRetry,
+  isUpstreamTransientFinal,
+  applyTierPreset,
+  resolveRequestedModel,
+  type RequestOverrides,
+} from "../claude.js";
+import { openaiToPrompt, extractToolNames, type OpenAIChatRequest } from "../convert.js";
 import { config } from "../config.js";
 
 const MODEL_NAME = "claude-code";
@@ -16,6 +23,13 @@ const openai = new Hono();
 openai.post("/v1/chat/completions", async (c) => {
   const body = (await c.req.json()) as OpenAIChatRequest;
   const { prompt, systemPrompt } = openaiToPrompt(body);
+  const tools = extractToolNames(body);
+  let overrides: RequestOverrides | undefined;
+  if (tools !== undefined) overrides = { ...(overrides ?? {}), tools };
+  const m = resolveRequestedModel(body.model);
+  if (m) overrides = { ...(overrides ?? {}), model: m };
+  if (body.effort) overrides = { ...(overrides ?? {}), effort: body.effort };
+  overrides = applyTierPreset(overrides, body.tier);
   const requestId = `chatcmpl-${uuidv4()}`;
   const model = body.model || MODEL_NAME;
   const created = Math.floor(Date.now() / 1000);
@@ -75,14 +89,15 @@ openai.post("/v1/chat/completions", async (c) => {
               finish();
             }
           },
-          systemPrompt
+          systemPrompt,
+          overrides
         );
       });
     });
   }
 
   // Non-streaming — aggregate text + tool_use from stream-json events.
-  const result = await execClaudeAggregate(prompt, systemPrompt);
+  const result = await execClaudeAggregate(prompt, systemPrompt, overrides);
 
   if (isUpstreamTransientFinal(result)) {
     c.header("Retry-After", "30");
@@ -138,17 +153,29 @@ openai.post("/v1/chat/completions", async (c) => {
  * List available models.
  */
 openai.get("/v1/models", (c) => {
-  return c.json({
-    object: "list",
-    data: [
-      {
-        id: MODEL_NAME,
-        object: "model",
-        created: 1700000000,
-        owned_by: "claude-code-router",
-      },
-    ],
-  });
+  // Built-in aliases always exposed.
+  const ids: string[] = [
+    MODEL_NAME,
+    "sonnet",
+    "opus",
+    "haiku",
+    // tier presets — resolved server-side into model+effort
+    "fast",
+    "balanced",
+    "deep",
+    ...config.allowedModels,
+  ];
+  const seen = new Set<string>();
+  const data = ids
+    .filter((id) => (seen.has(id) ? false : (seen.add(id), true)))
+    .map((id) => ({
+      id,
+      object: "model" as const,
+      created: 1700000000,
+      owned_by: "claude-code-router",
+    }));
+
+  return c.json({ object: "list", data });
 });
 
 export { openai };

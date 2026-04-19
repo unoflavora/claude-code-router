@@ -1,8 +1,15 @@
 import { Hono } from "hono";
 import { v4 as uuidv4 } from "uuid";
 import { stream as honoStream } from "hono/streaming";
-import { execClaudeAggregate, execClaudeStreamJsonWithRetry, isUpstreamTransientFinal } from "../claude.js";
-import { anthropicToPrompt, type AnthropicMessagesRequest } from "../convert.js";
+import {
+  execClaudeAggregate,
+  execClaudeStreamJsonWithRetry,
+  isUpstreamTransientFinal,
+  applyTierPreset,
+  resolveRequestedModel,
+  type RequestOverrides,
+} from "../claude.js";
+import { anthropicToPrompt, extractToolNames, type AnthropicMessagesRequest } from "../convert.js";
 import { config } from "../config.js";
 
 const anthropic = new Hono();
@@ -10,6 +17,13 @@ const anthropic = new Hono();
 anthropic.post("/v1/messages", async (c) => {
   const body = (await c.req.json()) as AnthropicMessagesRequest;
   const { prompt, systemPrompt } = anthropicToPrompt(body);
+  const tools = extractToolNames(body);
+  let overrides: RequestOverrides | undefined;
+  if (tools !== undefined) overrides = { ...(overrides ?? {}), tools };
+  const m = resolveRequestedModel(body.model);
+  if (m) overrides = { ...(overrides ?? {}), model: m };
+  if (body.effort) overrides = { ...(overrides ?? {}), effort: body.effort };
+  overrides = applyTierPreset(overrides, body.tier);
   const requestId = `msg_${uuidv4()}`;
   const model = body.model || "claude-code";
 
@@ -123,14 +137,15 @@ anthropic.post("/v1/messages", async (c) => {
               resolve();
             }
           },
-          systemPrompt
+          systemPrompt,
+          overrides
         );
       });
     });
   }
 
   // Non-streaming — aggregate all events into Anthropic content blocks.
-  const result = await execClaudeAggregate(prompt, systemPrompt);
+  const result = await execClaudeAggregate(prompt, systemPrompt, overrides);
 
   if (isUpstreamTransientFinal(result)) {
     c.header("Retry-After", "30");

@@ -2,9 +2,54 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { config } from "./config.js";
 
 /**
+ * Request-level overrides — values from the request body that win over
+ * server-level config for a single call.
+ */
+export interface RequestOverrides {
+  tools?: string[];
+  model?: string;
+  effort?: string;
+}
+
+/**
+ * Tier preset → (model, effort). Applied when the client sends `tier` and
+ * hasn't set `model`/`effort` explicitly. These aliases ride on top of the
+ * CLI's own `sonnet`/`opus`/`haiku` shortcuts.
+ */
+const TIER_PRESETS: Record<string, { model: string; effort: string }> = {
+  fast: { model: "haiku", effort: "low" },
+  balanced: { model: "sonnet", effort: "medium" },
+  deep: { model: "opus", effort: "high" },
+};
+
+/**
+ * Resolve tier → concrete overrides, without clobbering explicit values.
+ */
+export function applyTierPreset(
+  overrides: RequestOverrides | undefined,
+  tier: string | undefined
+): RequestOverrides | undefined {
+  if (!tier) return overrides;
+  const preset = TIER_PRESETS[tier.toLowerCase()];
+  if (!preset) return overrides;
+  const out: RequestOverrides = { ...(overrides ?? {}) };
+  if (!out.model) out.model = preset.model;
+  if (!out.effort) out.effort = preset.effort;
+  return out;
+}
+
+/**
+ * Given a list of fully-qualified tool names, return only the built-in tools
+ * (anything not prefixed `mcp__` — MCP tools come via --mcp-config, not --tools).
+ */
+function builtInSubset(tools: string[]): string[] {
+  return tools.filter((t) => !t.startsWith("mcp__"));
+}
+
+/**
  * Build the CLI args for `claude -p`.
  */
-function buildArgs(prompt: string, systemPrompt?: string): string[] {
+function buildArgs(prompt: string, systemPrompt?: string, overrides?: RequestOverrides): string[] {
   const args = ["-p", prompt];
 
   if (config.claudeMode === "lean") {
@@ -16,15 +61,31 @@ function buildArgs(prompt: string, systemPrompt?: string): string[] {
     args.push("--settings", config.claudeSettings);
   }
 
-  if (config.mcpConfig) {
+  // MCP config is loaded unless per-request `tools` was given and contains no
+  // mcp__* entries — that's how clients opt out of MCP for a particular call.
+  const loadMcp =
+    !!config.mcpConfig &&
+    (overrides?.tools === undefined || overrides.tools.some((t) => t.startsWith("mcp__")));
+  if (loadMcp) {
     args.push("--mcp-config", config.mcpConfig);
     if (config.strictMcpConfig) {
       args.push("--strict-mcp-config");
     }
   }
 
-  if (config.allowedTools) {
-    args.push("--allowedTools", config.allowedTools);
+  // Per-request `tools` (from the request body) overrides both allowlist and
+  // the --tools built-in filter. Unset = fall back to server-level config.
+  if (overrides?.tools !== undefined) {
+    args.push("--allowedTools", overrides.tools.join(" "));
+    args.push("--tools", builtInSubset(overrides.tools).join(","));
+  } else {
+    if (config.allowedTools) {
+      args.push("--allowedTools", config.allowedTools);
+    }
+    if (config.claudeTools !== "default") {
+      // "" disables all built-ins; a name list keeps just those.
+      args.push("--tools", config.claudeTools);
+    }
   }
 
   if (config.disallowedTools) {
@@ -43,8 +104,18 @@ function buildArgs(prompt: string, systemPrompt?: string): string[] {
     args.push("--append-system-prompt", config.claudeAppendSystemPrompt);
   }
 
-  if (config.claudeModel) {
-    args.push("--model", config.claudeModel);
+  const model = overrides?.model || config.claudeModel;
+  if (model) {
+    args.push("--model", model);
+  }
+
+  const effort = overrides?.effort || config.claudeEffort;
+  if (effort) {
+    args.push("--effort", effort);
+  }
+
+  if (config.claudeFallbackModel) {
+    args.push("--fallback-model", config.claudeFallbackModel);
   }
 
   if (config.maxTurnCount > 0) {
@@ -92,6 +163,29 @@ export interface ClaudeAggregated {
 }
 
 /**
+ * Model aliases clients may always pass regardless of ALLOWED_MODELS.
+ */
+export const BUILT_IN_MODEL_ALIASES = ["sonnet", "opus", "haiku"] as const;
+
+/**
+ * Decide the effective request-level model given a client-provided name.
+ * Returns undefined when the client didn't ask for one, or when the name is
+ * not allowed (router-pinned model is used instead). Tier names are stripped
+ * — those are handled via applyTierPreset.
+ */
+export function resolveRequestedModel(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const n = name.trim();
+  // Clients often send the router's own model id — ignore (use server default).
+  if (!n || n === "claude-code") return undefined;
+  // Tier sugar — resolved elsewhere.
+  if (n in TIER_PRESETS) return undefined;
+  if ((BUILT_IN_MODEL_ALIASES as readonly string[]).includes(n)) return n;
+  if (config.allowedModels.length === 0) return undefined;
+  return config.allowedModels.includes(n) ? n : undefined;
+}
+
+/**
  * Returns true if the aggregated response is just the upstream transient error
  * (meaning retries were exhausted). Callers should surface this as a 503.
  */
@@ -119,7 +213,8 @@ export function isUpstreamTransientFinal(r: ClaudeAggregated): boolean {
 export function execClaudeStreamJsonWithRetry(
   prompt: string,
   onEvent: (event: ClaudeEvent) => void,
-  systemPrompt?: string
+  systemPrompt?: string,
+  overrides?: RequestOverrides
 ): void {
   const maxAttempts = Math.max(1, config.upstreamRetryMax + 1);
 
@@ -146,6 +241,7 @@ export function execClaudeStreamJsonWithRetry(
           onEvent(event);
           return;
         }
+
 
         if (event.type === "text") {
           if (event.text === UPSTREAM_TRANSIENT_ERROR && !sawNonErrorContent) {
@@ -184,7 +280,8 @@ export function execClaudeStreamJsonWithRetry(
           onEvent(event);
         }
       },
-      systemPrompt
+      systemPrompt,
+      overrides
     );
   };
 
@@ -197,7 +294,11 @@ export function execClaudeStreamJsonWithRetry(
  * path, so tool calls are preserved in the non-streaming response body.
  * Retries transparently on upstream transients.
  */
-export function execClaudeAggregate(prompt: string, systemPrompt?: string): Promise<ClaudeAggregated> {
+export function execClaudeAggregate(
+  prompt: string,
+  systemPrompt?: string,
+  overrides?: RequestOverrides
+): Promise<ClaudeAggregated> {
   return new Promise((resolve, reject) => {
     const blocks: ClaudeContentBlock[] = [];
     let stopReason: string | null = null;
@@ -222,7 +323,8 @@ export function execClaudeAggregate(prompt: string, systemPrompt?: string): Prom
           reject(new Error(event.message));
         }
       },
-      systemPrompt
+      systemPrompt,
+      overrides
     );
   });
 }
@@ -234,9 +336,10 @@ export function execClaudeAggregate(prompt: string, systemPrompt?: string): Prom
 export function execClaudeStreamJson(
   prompt: string,
   onEvent: (event: ClaudeEvent) => void,
-  systemPrompt?: string
+  systemPrompt?: string,
+  overrides?: RequestOverrides
 ): { proc: ChildProcessWithoutNullStreams } {
-  const args = [...buildArgs(prompt, systemPrompt), "--output-format", "stream-json", "--verbose"];
+  const args = [...buildArgs(prompt, systemPrompt, overrides), "--output-format", "stream-json", "--verbose"];
 
   const proc = spawn(config.claudeBinary, args, {
     stdio: ["pipe", "pipe", "pipe"],
